@@ -539,16 +539,20 @@ class DownloadGUI:
             selected_files = filtered
 
         def task():
-            total = len(selected_files)
-            ok = skip_cnt = fail = 0
-
             import re as _re
             from urllib.parse import unquote as _unquote
             import requests as _req
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import threading
 
-            for idx, f in enumerate(selected_files):
+            total = len(selected_files)
+            ok = skip_cnt = fail = 0
+            lock = threading.Lock()
+            counter = [0]
+
+            def download_one(f):
                 if self.stop_event.is_set():
-                    break
+                    return None
                 name = f.get("name", "unknown")
                 safe_name = _unquote(name)
                 safe_name = _re.sub(r'[\\/:*?"<>|]', '_', safe_name).strip('. ')
@@ -560,28 +564,16 @@ class DownloadGUI:
                 os.makedirs(course_dir, exist_ok=True)
                 save_path = os.path.join(course_dir, safe_name)
 
-                self.root.after(0, lambda n=safe_name, i=idx, t=total:
-                    self.progress_label.config(text=f"[{i+1}/{t}] {n[:25]}..."))
-
                 if skip and os.path.exists(save_path):
-                    skip_cnt += 1
-                    progress = (idx + 1) / total * 100
-                    self.root.after(0, lambda p=progress, o=ok, s=skip_cnt, fv=fail:
-                        self._update_progress(p, o, s, fv))
-                    continue
+                    return "skip"
 
                 url = f.get("url", "")
                 if not url:
-                    fail += 1
-                    progress = (idx + 1) / total * 100
-                    self.root.after(0, lambda p=progress, o=ok, s=skip_cnt, fv=fail:
-                        self._update_progress(p, o, s, fv))
-                    continue
+                    return "fail"
 
-                downloaded = False
                 for attempt in range(retries):
                     if self.stop_event.is_set():
-                        break
+                        return None
                     try:
                         dl_headers = {
                             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -592,26 +584,38 @@ class DownloadGUI:
                             with open(save_path, "wb") as fout:
                                 for chunk in resp.iter_content(chunk_size=8192):
                                     if self.stop_event.is_set():
-                                        break
+                                        resp.close()
+                                        return None
                                     if chunk:
                                         fout.write(chunk)
-                            if not self.stop_event.is_set():
-                                downloaded = True
-                                break
+                            resp.close()
+                            return "ok"
                         resp.close()
                     except Exception:
                         pass
                     import time as _time
                     _time.sleep(1)
+                return "fail"
 
-                if downloaded:
-                    ok += 1
-                elif not self.stop_event.is_set():
-                    fail += 1
-
-                progress = (idx + 1) / total * 100
-                self.root.after(0, lambda p=progress, o=ok, s=skip_cnt, fv=fail:
-                    self._update_progress(p, o, s, fv))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(download_one, f): f for f in selected_files}
+                for future in as_completed(futures):
+                    if self.stop_event.is_set():
+                        break
+                    result = future.result()
+                    with lock:
+                        counter[0] += 1
+                        if result == "ok":
+                            ok += 1
+                        elif result == "skip":
+                            skip_cnt += 1
+                        elif result == "fail":
+                            fail += 1
+                        idx = counter[0]
+                        fname = futures[future].get("name", "?")[:25]
+                        progress = idx / total * 100
+                        self.root.after(0, lambda p=progress, o=ok, s=skip_cnt, fv=fail, i=idx, n=fname, t=total:
+                            self._update_progress_concurrent(p, o, s, fv, i, t, n))
 
             self.root.after(0, lambda: self._on_download_done(ok, skip_cnt, fail))
 
@@ -663,6 +667,10 @@ class DownloadGUI:
     def _update_progress(self, pct, ok, skip, fail):
         self.progress_var.set(pct)
         self.progress_label.config(text=f"成功:{ok} 跳过:{skip} 失败:{fail}")
+
+    def _update_progress_concurrent(self, pct, ok, skip, fail, idx, total, name):
+        self.progress_var.set(pct)
+        self.progress_label.config(text=f"[{idx}/{total}] {name} | 成功:{ok} 跳过:{skip} 失败:{fail}")
 
     def _on_download_done(self, ok, skip, fail):
         self.is_downloading = False
