@@ -1,0 +1,11 @@
+__pycache__/
+build/
+dist/
+*.spec
+config.json
+logs/
+downloads/
+test_download*.pptx
+feedback.txt
+.claude/
+*.pptx
